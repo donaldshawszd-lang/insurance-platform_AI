@@ -1,1 +1,584 @@
-1111111
+import os
+import json
+import sqlite3
+import pandas as pd
+from datetime import datetime, timedelta
+from flask import Flask, request, jsonify, render_template_string
+from flask_cors import CORS
+from openai import OpenAI
+
+app = Flask(__name__)
+CORS(app)
+
+# 数据库初始化
+DB_PATH = "claims.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS claims
+                 (claim_no TEXT PRIMARY KEY,
+                  policy_no TEXT,
+                  insured TEXT,
+                  applicant TEXT,
+                  receiver_account TEXT,
+                  product_name TEXT,
+                  product_code TEXT,
+                  insurance_name TEXT,
+                  insurance_code TEXT,
+                  sum_insured REAL,
+                  deductible REAL,
+                 赔付比例 REAL,
+                  reported_amount REAL,
+                  settlement_amount REAL)''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# DeepSeek客户端（需配置环境变量或前端传入）
+deepseek_client = None
+
+def get_deepseek_client(api_key):
+    if not api_key:
+        return None
+    return OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
+
+def get_all_cases():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT * FROM claims")
+    rows = c.fetchall()
+    columns = [desc[0] for desc in c.description]
+    conn.close()
+    cases = [dict(zip(columns, row)) for row in rows]
+    return cases
+
+def add_case(case_data):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        c.execute('''INSERT INTO claims VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                  (case_data['claim_no'], case_data['policy_no'], case_data['insured'],
+                   case_data['applicant'], case_data['receiver_account'], case_data['product_name'],
+                   case_data['product_code'], case_data['insurance_name'], case_data['insurance_code'],
+                   case_data['sum_insured'], case_data['deductible'], case_data['赔付比例'],
+                   case_data['reported_amount'], case_data['settlement_amount']))
+        conn.commit()
+        conn.close()
+        return True
+    except sqlite3.IntegrityError:
+        conn.close()
+        return False
+
+def delete_case(claim_no):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM claims WHERE claim_no = ?", (claim_no,))
+    conn.commit()
+    conn.close()
+
+def get_group_stats(cases):
+    """
+    生成用于DeepSeek分析的分组统计数据
+    包括：按保单号、按被保险人（保险标的）、按收款账号的统计，
+    以及按天、周、月的时间维度统计
+    """
+    df = pd.DataFrame(cases)
+    if df.empty:
+        return {
+            "policy_stats": [],
+            "insured_stats": [],
+            "account_stats": [],
+            "daily_stats": [],
+            "weekly_stats": [],
+            "monthly_stats": []
+        }
+    
+    # 确保日期字段（如果案件有报案日期，但字段中没有明确日期字段，使用当前模拟？由于原始字段没有日期，但为了时间维度需求，我们额外添加一个报案日期字段。
+    # 实际中理赔案件应有报案日期，但需求字段未包含，为满足时间维度，我们添加一个默认字段：创建时间或从报案号解析？由于要求按天周月统计，我们需要案件日期。
+    # 为演示完整性，在数据库中添加一个report_date字段，默认使用当前日期或解析报案号中的日期。但需求未强制，但为了功能实现，增加report_date字段。
+    # 调整数据库结构，增加report_date字段，默认使用当前日期。用户上传时可以手动添加或默认为当天。
+    # 重构init_db，增加report_date TEXT NOT NULL DEFAULT (date('now'))
+    # 注意：必须重新初始化或迁移。为了方便，这里修改代码自动迁移。
+    # 我们将在init_db中添加report_date列（如果不存在）
+    
+    # 确保report_date存在
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        c.execute("ALTER TABLE claims ADD COLUMN report_date TEXT DEFAULT (date('now'))")
+        conn.commit()
+    except:
+        pass
+    conn.close()
+    
+    # 重新获取数据并转换日期
+    cases = get_all_cases()
+    df = pd.DataFrame(cases)
+    if 'report_date' not in df.columns:
+        df['report_date'] = datetime.now().strftime('%Y-%m-%d')
+    df['report_date'] = pd.to_datetime(df['report_date'])
+    
+    # 保单号分组统计
+    policy_stats = []
+    for policy, group in df.groupby('policy_no'):
+        if pd.isna(policy) or policy == '':
+            continue
+        stats = {
+            "policy_no": policy,
+            "case_count": len(group),
+            "total_amount": group['settlement_amount'].sum(),
+            "avg_amount": group['settlement_amount'].mean(),
+            "cases": group['claim_no'].tolist()
+        }
+        policy_stats.append(stats)
+    
+    # 保险标的（被保险人）分组统计
+    insured_stats = []
+    for insured, group in df.groupby('insured'):
+        if pd.isna(insured) or insured == '':
+            continue
+        stats = {
+            "insured": insured,
+            "case_count": len(group),
+            "total_amount": group['settlement_amount'].sum(),
+            "avg_amount": group['settlement_amount'].mean(),
+            "cases": group['claim_no'].tolist()
+        }
+        insured_stats.append(stats)
+    
+    # 收款账号分组统计
+    account_stats = []
+    for account, group in df.groupby('receiver_account'):
+        if pd.isna(account) or account == '':
+            continue
+        stats = {
+            "receiver_account": account,
+            "case_count": len(group),
+            "total_amount": group['settlement_amount'].sum(),
+            "avg_amount": group['settlement_amount'].mean(),
+            "cases": group['claim_no'].tolist()
+        }
+        account_stats.append(stats)
+    
+    # 按天统计
+    daily_stats = df.groupby(df['report_date'].dt.date).agg(
+        case_count=('claim_no', 'count'),
+        total_amount=('settlement_amount', 'sum')
+    ).reset_index().rename(columns={'report_date': 'date'})
+    daily_stats['date'] = daily_stats['date'].astype(str)
+    
+    # 按周统计（ISO周）
+    df['week'] = df['report_date'].dt.isocalendar().week
+    df['year'] = df['report_date'].dt.year
+    weekly_stats = df.groupby(['year', 'week']).agg(
+        case_count=('claim_no', 'count'),
+        total_amount=('settlement_amount', 'sum')
+    ).reset_index()
+    weekly_stats['week_range'] = weekly_stats.apply(lambda x: f"{x['year']}-W{x['week']}", axis=1)
+    
+    # 按月统计
+    df['month'] = df['report_date'].dt.month
+    monthly_stats = df.groupby(['year', 'month']).agg(
+        case_count=('claim_no', 'count'),
+        total_amount=('settlement_amount', 'sum')
+    ).reset_index()
+    monthly_stats['month_range'] = monthly_stats.apply(lambda x: f"{x['year']}-{x['month']:02d}", axis=1)
+    
+    return {
+        "policy_stats": policy_stats,
+        "insured_stats": insured_stats,
+        "account_stats": account_stats,
+        "daily_stats": daily_stats.to_dict('records') if not daily_stats.empty else [],
+        "weekly_stats": weekly_stats[['week_range', 'case_count', 'total_amount']].to_dict('records') if not weekly_stats.empty else [],
+        "monthly_stats": monthly_stats[['month_range', 'case_count', 'total_amount']].to_dict('records') if not monthly_stats.empty else []
+    }
+
+def call_deepseek_analysis(api_key, model_text, group_stats, all_cases):
+    """
+    调用DeepSeek API，基于分组统计数据和用户模型输入，识别可疑案件和异常时间段
+    """
+    if not api_key:
+        return {"error": "缺少DeepSeek API Key"}
+    
+    client = get_deepseek_client(api_key)
+    if not client:
+        return {"error": "DeepSeek客户端初始化失败"}
+    
+    # 构建系统提示
+    system_prompt = """你是一个专业的保险理赔反欺诈分析专家。根据提供的理赔案件分组统计数据，识别出可能存在欺诈风险的案件。
+    
+分析要求：
+1. 对于同一保单号下的多起案件，分析是否存在理赔金额显著偏高或理赔频率异常（短时间内多次出险）。
+2. 对于同一被保险人（保险标的）下的案件，分析金额或频率是否异常。
+3. 对于同一收款账号下的案件，分析金额或频率是否异常。
+4. 对于按天、周、月统计的整体案件量及金额，分析是否存在异常的时间段（如突然激增或与常规波动不符）。
+
+请返回严格的JSON格式，包含两个字段：
+- suspected_claim_ids: 可疑案件的报案号列表（字符串数组）
+- abnormal_time_periods: 异常时间段列表，每个元素为字符串描述，例如 ["2025-01-15 数量异常", "2025年第3周金额异常", "2025-02月频率异常"]
+
+仅返回JSON，不要有其他内容。"""
+    
+    # 构建用户提示
+    user_prompt = f"""用户自定义模型规则/说明：{model_text}
+
+以下是当前所有理赔案件的基本信息（共{len(all_cases)}件）：
+案件明细（仅报案号、保单号、被保险人、收款账号、理赔金额、报案日期）：
+{json.dumps([{"claim_no": c["claim_no"], "policy_no": c["policy_no"], "insured": c["insured"], "receiver_account": c["receiver_account"], "settlement_amount": c["settlement_amount"], "report_date": c.get("report_date", "未知")} for c in all_cases], ensure_ascii=False, indent=2)}
+
+分组统计摘要：
+1. 按保单号分组统计：
+{json.dumps(group_stats['policy_stats'], ensure_ascii=False, indent=2)}
+
+2. 按被保险人（保险标的）分组统计：
+{json.dumps(group_stats['insured_stats'], ensure_ascii=False, indent=2)}
+
+3. 按收款账号分组统计：
+{json.dumps(group_stats['account_stats'], ensure_ascii=False, indent=2)}
+
+4. 按天统计：
+{json.dumps(group_stats['daily_stats'], ensure_ascii=False, indent=2)}
+
+5. 按周统计：
+{json.dumps(group_stats['weekly_stats'], ensure_ascii=False, indent=2)}
+
+6. 按月统计：
+{json.dumps(group_stats['monthly_stats'], ensure_ascii=False, indent=2)}
+
+请根据以上数据，结合用户模型规则，找出所有可疑案件（返回报案号列表）和异常时间段（时间粒度根据情况可以是天、周、月）。"""
+    
+    try:
+        response = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.3,
+            response_format={"type": "json_object"}
+        )
+        content = response.choices[0].message.content
+        result = json.loads(content)
+        return result
+    except Exception as e:
+        return {"error": f"DeepSeek调用失败: {str(e)}"}
+
+# Flask路由
+@app.route('/')
+def index():
+    html = '''
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <title>保险理赔欺诈案件识别工具</title>
+        <style>
+            body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
+            .container { max-width: 1400px; margin: auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+            h1, h2 { color: #333; }
+            .section { margin-bottom: 30px; border: 1px solid #ddd; padding: 15px; border-radius: 5px; background: #fafafa; }
+            table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+            th, td { border: 1px solid #ddd; padding: 8px; text-align: left; font-size: 12px; }
+            th { background-color: #4CAF50; color: white; }
+            .upload-area { display: flex; gap: 20px; flex-wrap: wrap; }
+            .form-group { margin-bottom: 10px; }
+            input, textarea, select { width: 100%; padding: 8px; margin: 5px 0; border: 1px solid #ccc; border-radius: 4px; }
+            button { background-color: #4CAF50; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; margin-top: 10px; }
+            button:hover { background-color: #45a049; }
+            .suspected { background-color: #ffcccc; }
+            .abnormal-time { background-color: #ffeb3b; font-weight: bold; }
+            .error { color: red; }
+            .success { color: green; }
+            .model-input { width: 100%; height: 100px; }
+            .flex-row { display: flex; gap: 10px; align-items: center; }
+        </style>
+        <script>
+            async function loadCases() {
+                const response = await fetch('/api/cases');
+                const cases = await response.json();
+                const tbody = document.getElementById('cases-tbody');
+                tbody.innerHTML = '';
+                cases.forEach(c => {
+                    const row = tbody.insertRow();
+                    row.setAttribute('data-claim-no', c.claim_no);
+                    for (let key of ['claim_no', 'policy_no', 'insured', 'applicant', 'receiver_account', 'product_name', 'product_code', 'insurance_name', 'insurance_code', 'sum_insured', 'deductible', '赔付比例', 'reported_amount', 'settlement_amount', 'report_date']) {
+                        const cell = row.insertCell();
+                        cell.textContent = c[key] !== undefined ? c[key] : '';
+                    }
+                    const delCell = row.insertCell();
+                    const delBtn = document.createElement('button');
+                    delBtn.textContent = '删除';
+                    delBtn.onclick = () => deleteCase(c.claim_no);
+                    delCell.appendChild(delBtn);
+                });
+            }
+            
+            async function deleteCase(claimNo) {
+                if (confirm('确定删除该案件吗？')) {
+                    await fetch(`/api/cases/${claimNo}`, { method: 'DELETE' });
+                    loadCases();
+                }
+            }
+            
+            async function uploadCSV() {
+                const fileInput = document.getElementById('csvFile');
+                if (!fileInput.files.length) {
+                    alert('请选择CSV文件');
+                    return;
+                }
+                const formData = new FormData();
+                formData.append('file', fileInput.files[0]);
+                const response = await fetch('/api/upload', { method: 'POST', body: formData });
+                const result = await response.json();
+                if (response.ok) {
+                    alert(result.message);
+                    loadCases();
+                } else {
+                    alert('上传失败: ' + result.error);
+                }
+            }
+            
+            async function addCaseManually() {
+                const fields = ['claim_no', 'policy_no', 'insured', 'applicant', 'receiver_account', 'product_name', 'product_code', 'insurance_name', 'insurance_code', 'sum_insured', 'deductible', '赔付比例', 'reported_amount', 'settlement_amount', 'report_date'];
+                const caseData = {};
+                for (let f of fields) {
+                    let val = document.getElementById(f).value;
+                    if (f === 'sum_insured' || f === 'deductible' || f === '赔付比例' || f === 'reported_amount' || f === 'settlement_amount') {
+                        val = parseFloat(val);
+                        if (isNaN(val)) val = 0;
+                    }
+                    caseData[f] = val;
+                }
+                const response = await fetch('/api/cases', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(caseData)
+                });
+                const result = await response.json();
+                if (response.ok) {
+                    alert(result.message);
+                    for (let f of fields) document.getElementById(f).value = '';
+                    loadCases();
+                } else {
+                    alert('添加失败: ' + result.error);
+                }
+            }
+            
+            async function detectFraud() {
+                const apiKey = document.getElementById('apiKey').value.trim();
+                if (!apiKey) {
+                    alert('请输入DeepSeek API Key');
+                    return;
+                }
+                const modelText = document.getElementById('modelText').value;
+                const response = await fetch('/api/detect', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ api_key: apiKey, model_text: modelText })
+                });
+                const result = await response.json();
+                if (response.ok) {
+                    // 高亮可疑案件
+                    const rows = document.querySelectorAll('#cases-tbody tr');
+                    rows.forEach(row => {
+                        row.classList.remove('suspected');
+                        const claimNoCell = row.cells[0];
+                        if (result.suspected_claim_ids && result.suspected_claim_ids.includes(claimNoCell.textContent)) {
+                            row.classList.add('suspected');
+                        }
+                    });
+                    // 显示可疑案件列表
+                    const suspectedDiv = document.getElementById('suspectedList');
+                    if (result.suspected_claim_ids && result.suspected_claim_ids.length > 0) {
+                        suspectedDiv.innerHTML = '<h3>可疑案件列表</h3><ul>' + result.suspected_claim_ids.map(id => `<li>${id}</li>`).join('') + '</ul>';
+                    } else {
+                        suspectedDiv.innerHTML = '<p>未发现可疑案件</p>';
+                    }
+                    // 显示异常时间段
+                    const timeDiv = document.getElementById('abnormalTimePeriods');
+                    if (result.abnormal_time_periods && result.abnormal_time_periods.length > 0) {
+                        timeDiv.innerHTML = '<h3>异常时间段</h3><ul>' + result.abnormal_time_periods.map(t => `<li class="abnormal-time">${t}</li>`).join('') + '</ul>';
+                    } else {
+                        timeDiv.innerHTML = '<p>未发现异常时间段</p>';
+                    }
+                } else {
+                    alert('检测失败: ' + result.error);
+                }
+            }
+            
+            window.onload = loadCases;
+        </script>
+    </head>
+    <body>
+        <div class="container">
+            <h1>保险理赔欺诈案件识别工具</h1>
+            
+            <div class="section">
+                <h2>案件上传入口</h2>
+                <div class="upload-area">
+                    <div style="flex:1">
+                        <h3>批量上传CSV</h3>
+                        <p>CSV文件需包含以下列：报案号,保单号,被保险人,投保人,收款账号,产品名称,产品代码,险种名称,险种代码,保额,免赔额,赔付比例,报案金额,理赔金额,报案日期(可选)</p>
+                        <input type="file" id="csvFile" accept=".csv">
+                        <button onclick="uploadCSV()">上传CSV</button>
+                    </div>
+                    <div style="flex:1">
+                        <h3>手动添加案件</h3>
+                        <div style="display: grid; grid-template-columns: repeat(3,1fr); gap: 5px;">
+                            <input id="claim_no" placeholder="报案号" required>
+                            <input id="policy_no" placeholder="保单号">
+                            <input id="insured" placeholder="被保险人">
+                            <input id="applicant" placeholder="投保人">
+                            <input id="receiver_account" placeholder="收款账号">
+                            <input id="product_name" placeholder="产品名称">
+                            <input id="product_code" placeholder="产品代码">
+                            <input id="insurance_name" placeholder="险种名称">
+                            <input id="insurance_code" placeholder="险种代码">
+                            <input id="sum_insured" placeholder="保额" type="number">
+                            <input id="deductible" placeholder="免赔额" type="number">
+                            <input id="赔付比例" placeholder="赔付比例" type="number">
+                            <input id="reported_amount" placeholder="报案金额" type="number">
+                            <input id="settlement_amount" placeholder="理赔金额" type="number">
+                            <input id="report_date" placeholder="报案日期 (YYYY-MM-DD)" value="{{ now_date }}">
+                        </div>
+                        <button onclick="addCaseManually()">添加案件</button>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="section">
+                <h2>模型入口 & 异常检测</h2>
+                <div>
+                    <label>DeepSeek API Key: </label>
+                    <input type="password" id="apiKey" style="width: 300px;" placeholder="sk-...">
+                    <label>模型指令/规则说明:</label>
+                    <textarea id="modelText" class="model-input" placeholder="例如：请重点关注同一收款账号下单日理赔金额超过10万的案件，以及同一保单号下月出险次数超过3次的案件。也可以留空使用默认规则。"></textarea>
+                    <button onclick="detectFraud()">开始检测（调用DeepSeek）</button>
+                </div>
+            </div>
+            
+            <div class="section">
+                <h2>所有理赔案件列表</h2>
+                <div style="overflow-x: auto;">
+                    <table>
+                        <thead>
+                            <tr><th>报案号</th><th>保单号</th><th>被保险人</th><th>投保人</th><th>收款账号</th><th>产品名称</th><th>产品代码</th><th>险种名称</th><th>险种代码</th><th>保额</th><th>免赔额</th><th>赔付比例</th><th>报案金额</th><th>理赔金额</th><th>报案日期</th><th>操作</th></tr>
+                        </thead>
+                        <tbody id="cases-tbody"></tbody>
+                    </table>
+                </div>
+            </div>
+            
+            <div class="section" id="suspectedList">
+                <h2>可疑案件（单独显示）</h2>
+                <p>等待检测...</p>
+            </div>
+            
+            <div class="section" id="abnormalTimePeriods">
+                <h2>异常时间段标记</h2>
+                <p>等待检测...</p>
+            </div>
+        </div>
+    </body>
+    </html>
+    '''
+    # 注入默认日期
+    from datetime import date
+    return render_template_string(html, now_date=date.today().isoformat())
+
+@app.route('/api/cases', methods=['GET'])
+def get_cases():
+    cases = get_all_cases()
+    return jsonify(cases)
+
+@app.route('/api/cases', methods=['POST'])
+def add_case_api():
+    data = request.json
+    # 补全缺失字段默认值
+    required_fields = ['claim_no', 'policy_no', 'insured', 'applicant', 'receiver_account', 'product_name',
+                       'product_code', 'insurance_name', 'insurance_code', 'sum_insured', 'deductible', 
+                       '赔付比例', 'reported_amount', 'settlement_amount']
+    for f in required_fields:
+        if f not in data:
+            data[f] = '' if f not in ['sum_insured','deductible','赔付比例','reported_amount','settlement_amount'] else 0.0
+    if 'report_date' not in data or not data['report_date']:
+        data['report_date'] = datetime.now().strftime('%Y-%m-%d')
+    success = add_case(data)
+    if success:
+        return jsonify({"message": "案件添加成功"}), 201
+    else:
+        return jsonify({"error": "报案号已存在"}), 400
+
+@app.route('/api/cases/<claim_no>', methods=['DELETE'])
+def delete_case_api(claim_no):
+    delete_case(claim_no)
+    return jsonify({"message": "删除成功"})
+
+@app.route('/api/upload', methods=['POST'])
+def upload_csv():
+    if 'file' not in request.files:
+        return jsonify({"error": "未上传文件"}), 400
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({"error": "文件名为空"}), 400
+    try:
+        df = pd.read_csv(file)
+        # 标准化列名映射
+        column_mapping = {
+            '报案号': 'claim_no', '保单号': 'policy_no', '被保险人': 'insured', '投保人': 'applicant',
+            '收款账号': 'receiver_account', '产品名称': 'product_name', '产品代码': 'product_code',
+            '险种名称': 'insurance_name', '险种代码': 'insurance_code', '保额': 'sum_insured',
+            '免赔额': 'deductible', '赔付比例': '赔付比例', '报案金额': 'reported_amount',
+            '理赔金额': 'settlement_amount', '报案日期': 'report_date'
+        }
+        df.rename(columns=column_mapping, inplace=True)
+        required = ['claim_no', 'policy_no', 'insured', 'applicant', 'receiver_account', 'product_name',
+                    'product_code', 'insurance_name', 'insurance_code', 'sum_insured', 'deductible',
+                    '赔付比例', 'reported_amount', 'settlement_amount']
+        for col in required:
+            if col not in df.columns:
+                df[col] = '' if col not in ['sum_insured','deductible','赔付比例','reported_amount','settlement_amount'] else 0.0
+        if 'report_date' not in df.columns:
+            df['report_date'] = datetime.now().strftime('%Y-%m-%d')
+        # 逐个插入
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        success_count = 0
+        for _, row in df.iterrows():
+            try:
+                c.execute('''INSERT INTO claims VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                          (row['claim_no'], row['policy_no'], row['insured'], row['applicant'],
+                           row['receiver_account'], row['product_name'], row['product_code'],
+                           row['insurance_name'], row['insurance_code'], float(row['sum_insured']),
+                           float(row['deductible']), float(row['赔付比例']), float(row['reported_amount']),
+                           float(row['settlement_amount']), row['report_date']))
+                success_count += 1
+            except sqlite3.IntegrityError:
+                continue
+        conn.commit()
+        conn.close()
+        return jsonify({"message": f"上传完成，成功添加 {success_count} 条，重复跳过"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/detect', methods=['POST'])
+def detect():
+    data = request.json
+    api_key = data.get('api_key')
+    model_text = data.get('model_text', '默认异常检测：识别各分组中理赔总额超过组内均值2倍标准差，或者案件频率明显高于平均水平的情况，同时识别时间序列上的异常波动。')
+    cases = get_all_cases()
+    if not cases:
+        return jsonify({"error": "暂无案件数据，请先上传案件"}), 400
+    group_stats = get_group_stats(cases)
+    result = call_deepseek_analysis(api_key, model_text, group_stats, cases)
+    if 'error' in result:
+        return jsonify({"error": result['error']}), 500
+    return jsonify({
+        "suspected_claim_ids": result.get('suspected_claim_ids', []),
+        "abnormal_time_periods": result.get('abnormal_time_periods', [])
+    })
+
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0', port=5000)
